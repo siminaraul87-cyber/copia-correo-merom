@@ -408,8 +408,18 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
     ):
         # Mantiene el huso horario de INTERNALDATE al pasarlo a Gmail.
         origen.normalise_times = False
-        origen.login(secretos["ORIGEN_USUARIO"], secretos["ORIGEN_PASSWORD"])
-        gmail.login(secretos["GMAIL_USUARIO"], secretos["GMAIL_APP_PASSWORD"])
+        try:
+            origen.login(secretos["ORIGEN_USUARIO"], secretos["ORIGEN_PASSWORD"])
+            logging.info("Login en info@merom.eu correcto.")
+        except Exception:
+            logging.error("Fallo al entrar en info@merom.eu: revisa ORIGEN_USUARIO y ORIGEN_PASSWORD.")
+            raise
+        try:
+            gmail.login(secretos["GMAIL_USUARIO"], secretos["GMAIL_APP_PASSWORD"])
+            logging.info("Login en Gmail correcto.")
+        except Exception:
+            logging.error("Fallo al entrar en Gmail: revisa GMAIL_USUARIO y que GMAIL_APP_PASSWORD sea la contraseña de aplicación (16 letras), no la normal.")
+            raise
 
         carpeta_todos, carpetas_gmail = buscar_carpeta_todos(gmail)
         # El origen siempre queda en solo lectura; Gmail se abre para poder
