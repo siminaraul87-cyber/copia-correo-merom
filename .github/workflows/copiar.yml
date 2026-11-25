@@ -1,0 +1,44 @@
+name: Copiar correo a Gmail
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      dias:
+        description: "Días que se revisarán (usa 3650 para la primera copia)"
+        required: true
+        default: 3
+        type: number
+
+concurrency:
+  group: copiar-correo
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  copiar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v7
+
+      - name: Preparar Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Copiar mensajes
+        env:
+          ORIGEN_USUARIO: ${{ secrets.ORIGEN_USUARIO }}
+          ORIGEN_PASSWORD: ${{ secrets.ORIGEN_PASSWORD }}
+          GMAIL_USUARIO: ${{ secrets.GMAIL_USUARIO }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          DIAS: ${{ inputs.dias || 3 }}
+        run: python copiar_correo.py --dias "$DIAS"
