@@ -269,6 +269,20 @@ def validar_secretos() -> dict[str, str]:
     return valores
 
 
+def buscar_en_gmail(gmail: IMAPClient, message_id: str) -> list[int]:
+    """Busca un correo en Gmail por Message-ID.
+
+    Primero con la búsqueda de Gmail (rápida); si Gmail rechaza el Message-ID
+    por tener caracteres raros, usa la búsqueda IMAP estándar por cabecera.
+    """
+    try:
+        return list(gmail.gmail_search(f"rfc822msgid:{message_id}"))
+    except Exception as error:
+        if es_error_de_conexion(error):
+            raise
+        return list(gmail.search(["HEADER", "Message-ID", message_id]))
+
+
 def procesar_mensaje(
     origen: IMAPClient,
     gmail: IMAPClient,
@@ -302,7 +316,7 @@ def procesar_mensaje(
         id_sintetico = True
 
     consulta = f"rfc822msgid:{message_id}"
-    uids_existentes = gmail.gmail_search(consulta)
+    uids_existentes = buscar_en_gmail(gmail, message_id)
     if uids_existentes:
         # Si esta ejecución ya copió el mismo mensaje desde otra carpeta,
         # aplica la etiqueta adicional sin crear otra copia.
@@ -327,11 +341,21 @@ def procesar_mensaje(
 
     # APPEND conserva el mensaje original, salvo el único header sintético
     # en los casos que carecen de un Message-ID válido.
-    gmail.append(ETIQUETA_BASE, mensaje_para_gmail, msg_time=fecha_interna)
+    try:
+        gmail.append(ETIQUETA_BASE, mensaje_para_gmail, msg_time=fecha_interna)
+    except Exception as error:
+        if not es_error_de_conexion(error):
+            # Motivo que da Gmail (p. ej. tamaño); no incluye el contenido del correo.
+            logging.error(
+                "Gmail rechazó un correo de %.1f MB: %s",
+                len(mensaje_para_gmail) / 1_000_000,
+                str(error)[:200],
+            )
+        raise
     copiados_en_esta_ejecucion.add(message_id)
 
     # Localiza el UID creado y agrega etiquetas al mismo mensaje.
-    uids_gmail = gmail.gmail_search(consulta)
+    uids_gmail = buscar_en_gmail(gmail, message_id)
     if not uids_gmail:
         raise RuntimeError("Gmail no encontró el mensaje recién añadido")
     etiquetas_extra = [
