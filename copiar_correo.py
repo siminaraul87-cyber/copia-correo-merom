@@ -42,6 +42,8 @@ ORIGEN_SERVIDOR = "mail.merom.eu"
 GMAIL_SERVIDOR = "imap.gmail.com"
 PUERTO_IMAP = 993
 ETIQUETA_BASE = "MEROM"
+# Gmail rechaza por IMAP los correos de más de ~35 MB.
+LIMITE_GMAIL_BYTES = 35_000_000
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -295,8 +297,15 @@ def procesar_mensaje(
 ) -> tuple[str, bool]:
     """Copia un mensaje nuevo y devuelve el resultado y si usó ID sintético."""
     respuesta_cabecera = origen.fetch(
-        [uid], ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"]
+        [uid], ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]", "RFC822.SIZE"]
     )
+    if uid not in respuesta_cabecera:
+        # El correo se borró/movió mientras lo revisábamos; saldrá en su nueva carpeta.
+        return "desaparecido", False
+    tamano = respuesta_cabecera[uid].get(b"RFC822.SIZE") or 0
+    if tamano > LIMITE_GMAIL_BYTES:
+        # Gmail rechaza los correos tan grandes ([TOOBIG]); no se descarga en vano.
+        return "grande", False
     cabecera = obtener_cabecera_message_id(respuesta_cabecera[uid])
     message_id = obtener_id_mensaje(cabecera)
     mensaje_para_gmail: bytes | None = None
@@ -442,6 +451,14 @@ def revisar_carpeta(
                     estadisticas["ids_sinteticos"] += 1
             elif resultado == "duplicado":
                 estadisticas["duplicados"] += 1
+            elif resultado == "grande":
+                estadisticas["grandes"] += 1
+                logging.warning(
+                    "Correo demasiado grande para Gmail en la carpeta %s (uid %s); queda solo en info@merom.eu.",
+                    nombre, uid,
+                )
+            elif resultado == "desaparecido":
+                pass
             else:
                 estadisticas["ubicaciones_adicionales"] += 1
             if procesados is not None:
@@ -449,6 +466,9 @@ def revisar_carpeta(
         except Exception as error:
             if es_error_de_conexion(error):
                 raise ConexionPerdida() from error
+            # No se reintenta en cada pasada de vigilancia; la próxima ejecución lo volverá a intentar.
+            if procesados is not None:
+                procesados.add(uid)
             estadisticas["errores"] += 1
             logging.error(
                 "Error al procesar un mensaje de origen (%s, línea %s); se continúa.",
@@ -497,6 +517,7 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
         "duplicados": 0,
         "ubicaciones_adicionales": 0,
         "ids_sinteticos": 0,
+        "grandes": 0,
     }
     copiados_en_esta_ejecucion: set[str] = set()
     reconexiones = 0
@@ -582,11 +603,12 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
 
     logging.info(
         "Resumen: copiados=%d, IDs sintéticos=%d, ubicaciones adicionales=%d, "
-        "ya existentes=%d, errores=%d, reconexiones=%d.",
+        "ya existentes=%d, demasiado grandes=%d, errores=%d, reconexiones=%d.",
         estadisticas["copiados"],
         estadisticas["ids_sinteticos"],
         estadisticas["ubicaciones_adicionales"],
         estadisticas["duplicados"],
+        estadisticas["grandes"],
         estadisticas["errores"],
         reconexiones,
     )
