@@ -385,8 +385,9 @@ def revisar_carpeta(
         except Exception as error:
             estadisticas["errores"] += 1
             logging.error(
-                "Error al procesar un mensaje de origen (%s); se continúa.",
+                "Error al procesar un mensaje de origen (%s, línea %s); se continúa.",
                 type(error).__name__,
+                error.__traceback__.tb_next.tb_lineno if error.__traceback__ and error.__traceback__.tb_next else "?",
             )
 
 
@@ -428,6 +429,9 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
 
         carpetas = []
         for flags, separador, nombre in origen.list_folders():
+            # IMAPClient devuelve el separador en bytes (p. ej. b"."); se pasa a texto.
+            separador = texto_imap(separador) if separador else None
+            nombre = texto_imap(nombre)
             atributos = {texto_imap(flag).casefold() for flag in flags}
             if r"\noselect" in atributos:
                 continue
@@ -521,7 +525,9 @@ def main() -> int:
     except Exception as error:
         # No se imprimen mensajes del servidor que pudieran incluir datos
         # privados; basta con el tipo de error para consultar el log.
-        logging.error("La ejecución no pudo completarse (%s).", type(error).__name__)
+        import traceback
+        lineas = " <- ".join(f"línea {f.lineno} ({f.name})" for f in reversed(traceback.extract_tb(error.__traceback__)))
+        logging.error("La ejecución no pudo completarse (%s) en %s.", type(error).__name__, lineas)
         return 1
 
 
