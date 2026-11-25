@@ -3,6 +3,9 @@ name: Copiar correo a Gmail
 on:
   schedule:
     - cron: "*/10 * * * *"
+    # Una vez al día repasa TODO el buzón: completa lo que faltara (cortes,
+    # límites de Gmail...) sin duplicar lo que ya está copiado.
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       dias:
@@ -11,8 +14,10 @@ on:
         default: 3
         type: number
 
+# Las copias completas (diaria o manual con muchos días) van en su propio
+# grupo para que las ejecuciones de cada 10 minutos no las cancelen.
 concurrency:
-  group: copiar-correo
+  group: ${{ (inputs.dias > 3 || github.event.schedule == '17 3 * * *') && 'copiar-completa' || 'copiar-normal' }}
   cancel-in-progress: false
 
 permissions:
@@ -40,5 +45,5 @@ jobs:
           ORIGEN_PASSWORD: ${{ secrets.ORIGEN_PASSWORD }}
           GMAIL_USUARIO: ${{ secrets.GMAIL_USUARIO }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          DIAS: ${{ inputs.dias || 3 }}
+          DIAS: ${{ inputs.dias || (github.event.schedule == '17 3 * * *' && 3650) || 3 }}
         run: python copiar_correo.py --dias "$DIAS"
