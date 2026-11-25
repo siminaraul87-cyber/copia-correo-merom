@@ -19,6 +19,24 @@ from typing import Any
 from imapclient import IMAPClient
 
 
+class ConexionPerdida(Exception):
+    """Se cortó la conexión IMAP; hay que reconectar y repetir la carpeta."""
+
+
+def es_error_de_conexion(error: Exception) -> bool:
+    """Detecta cortes de conexión (abort, socket cerrado, timeout...)."""
+    nombre = type(error).__name__.lower()
+    texto = str(error).lower()
+    return (
+        nombre in {"abort", "aborterror", "brokenpipeerror", "connectionreseterror",
+                   "connectionabortederror", "timeouterror", "sslerror", "sslzeroreturnerror",
+                   "sslEOFError".lower(), "socketerror", "oserror", "eoferror"}
+        or isinstance(error, (OSError, EOFError))
+        or "socket" in texto or "eof" in texto or "connection" in texto
+        or "closed" in texto or "bye" in texto
+    )
+
+
 # Servidores de correo. Los usuarios y contraseñas siempre vienen de Secrets.
 ORIGEN_SERVIDOR = "mail.merom.eu"
 GMAIL_SERVIDOR = "imap.gmail.com"
@@ -342,6 +360,8 @@ def revisar_carpeta(
         origen.select_folder(nombre, readonly=True)
         uids = origen.search(["SINCE", desde])
     except Exception as error:
+        if es_error_de_conexion(error):
+            raise ConexionPerdida() from error
         estadisticas["errores"] += 1
         logging.error(
             "No se pudo revisar una carpeta de origen (%s).",
@@ -383,6 +403,8 @@ def revisar_carpeta(
             if procesados is not None:
                 procesados.add(uid)
         except Exception as error:
+            if es_error_de_conexion(error):
+                raise ConexionPerdida() from error
             estadisticas["errores"] += 1
             logging.error(
                 "Error al procesar un mensaje de origen (%s, línea %s); se continúa.",
@@ -391,8 +413,39 @@ def revisar_carpeta(
             )
 
 
+def conectar(secretos: dict[str, str]) -> tuple[IMAPClient, IMAPClient, str, set[str]]:
+    """Abre las dos conexiones (origen en solo lectura) y localiza \\All en Gmail."""
+    origen = IMAPClient(ORIGEN_SERVIDOR, port=PUERTO_IMAP, ssl=True, timeout=120)
+    # Mantiene el huso horario de INTERNALDATE al pasarlo a Gmail.
+    origen.normalise_times = False
+    try:
+        origen.login(secretos["ORIGEN_USUARIO"], secretos["ORIGEN_PASSWORD"])
+        logging.info("Login en info@merom.eu correcto.")
+    except Exception:
+        logging.error("Fallo al entrar en info@merom.eu: revisa ORIGEN_USUARIO y ORIGEN_PASSWORD.")
+        raise
+    gmail = IMAPClient(GMAIL_SERVIDOR, port=PUERTO_IMAP, ssl=True, timeout=120)
+    try:
+        gmail.login(secretos["GMAIL_USUARIO"], secretos["GMAIL_APP_PASSWORD"])
+        logging.info("Login en Gmail correcto.")
+    except Exception:
+        logging.error("Fallo al entrar en Gmail: revisa GMAIL_USUARIO y que GMAIL_APP_PASSWORD sea la contraseña de aplicación (16 letras), no la normal.")
+        raise
+    carpeta_todos, carpetas_gmail = buscar_carpeta_todos(gmail)
+    gmail.select_folder(carpeta_todos, readonly=False)
+    return origen, gmail, carpeta_todos, carpetas_gmail
+
+
+def cerrar(*clientes: IMAPClient) -> None:
+    for cliente in clientes:
+        try:
+            cliente.logout()
+        except Exception:
+            pass
+
+
 def copiar(dias: int, secretos: dict[str, str]) -> int:
-    """Copia los mensajes recientes; devuelve el número de errores."""
+    """Copia los mensajes recientes; reconecta si se corta. Devuelve nº de errores."""
     desde = datetime.now(timezone.utc).date() - timedelta(days=dias - 1)
     estadisticas = {
         "errores": 0,
@@ -402,31 +455,35 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
         "ids_sinteticos": 0,
     }
     copiados_en_esta_ejecucion: set[str] = set()
+    reconexiones = 0
+    MAX_RECONEXIONES = 20
 
-    with (
-        IMAPClient(ORIGEN_SERVIDOR, port=PUERTO_IMAP, ssl=True) as origen,
-        IMAPClient(GMAIL_SERVIDOR, port=PUERTO_IMAP, ssl=True) as gmail,
-    ):
-        # Mantiene el huso horario de INTERNALDATE al pasarlo a Gmail.
-        origen.normalise_times = False
-        try:
-            origen.login(secretos["ORIGEN_USUARIO"], secretos["ORIGEN_PASSWORD"])
-            logging.info("Login en info@merom.eu correcto.")
-        except Exception:
-            logging.error("Fallo al entrar en info@merom.eu: revisa ORIGEN_USUARIO y ORIGEN_PASSWORD.")
-            raise
-        try:
-            gmail.login(secretos["GMAIL_USUARIO"], secretos["GMAIL_APP_PASSWORD"])
-            logging.info("Login en Gmail correcto.")
-        except Exception:
-            logging.error("Fallo al entrar en Gmail: revisa GMAIL_USUARIO y que GMAIL_APP_PASSWORD sea la contraseña de aplicación (16 letras), no la normal.")
-            raise
+    origen, gmail, _todos, carpetas_gmail = conectar(secretos)
 
-        carpeta_todos, carpetas_gmail = buscar_carpeta_todos(gmail)
-        # El origen siempre queda en solo lectura; Gmail se abre para poder
-        # añadir etiquetas al mensaje que acabamos de copiar.
-        gmail.select_folder(carpeta_todos, readonly=False)
+    def reconectar() -> None:
+        nonlocal origen, gmail, carpetas_gmail, reconexiones
+        reconexiones += 1
+        if reconexiones > MAX_RECONEXIONES:
+            raise RuntimeError("Demasiados cortes de conexión; se reintentará en la próxima ejecución")
+        cerrar(origen, gmail)
+        espera = min(30 * reconexiones, 300)
+        logging.warning("Conexión perdida; reconectando en %d s (intento %d).", espera, reconexiones)
+        time.sleep(espera)
+        origen, gmail, _t, carpetas_gmail = conectar(secretos)
 
+    def revisar_con_reintentos(carpeta, procesados=None, detalle=None) -> None:
+        while True:
+            try:
+                revisar_carpeta(
+                    origen, gmail, carpeta, desde, carpetas_gmail,
+                    copiados_en_esta_ejecucion, estadisticas,
+                    procesados=procesados, detalle=detalle,
+                )
+                return
+            except ConexionPerdida:
+                reconectar()  # y se repite la carpeta; lo ya copiado se salta
+
+    try:
         carpetas = []
         for flags, separador, nombre in origen.list_folders():
             # IMAPClient devuelve el separador en bytes (p. ej. b"."); se pasa a texto.
@@ -450,17 +507,14 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
 
         logging.info("Carpetas de origen que se revisarán: %d", len(carpetas))
         for indice_carpeta, carpeta in enumerate(carpetas, start=1):
-            procesados = procesados_vigilados.get(carpeta[2])
-            revisar_carpeta(
-                origen,
-                gmail,
+            revisar_con_reintentos(
                 carpeta,
-                desde,
-                carpetas_gmail,
-                copiados_en_esta_ejecucion,
-                estadisticas,
-                procesados=procesados,
+                procesados=procesados_vigilados.get(carpeta[2]),
                 detalle=(indice_carpeta, len(carpetas)),
+            )
+            logging.info(
+                "Llevamos: copiados=%d, ya existentes=%d, errores=%d.",
+                estadisticas["copiados"], estadisticas["duplicados"], estadisticas["errores"],
             )
 
         if carpetas_vigiladas:
@@ -476,25 +530,21 @@ def copiar(dias: int, secretos: dict[str, str]) -> int:
                     time.sleep(espera)
                 logging.info("Pasada de vigilancia %d/8.", numero_pasada)
                 for carpeta in carpetas_vigiladas:
-                    revisar_carpeta(
-                        origen,
-                        gmail,
-                        carpeta,
-                        desde,
-                        carpetas_gmail,
-                        copiados_en_esta_ejecucion,
-                        estadisticas,
-                        procesados=procesados_vigilados[carpeta[2]],
+                    revisar_con_reintentos(
+                        carpeta, procesados=procesados_vigilados[carpeta[2]]
                     )
+    finally:
+        cerrar(origen, gmail)
 
     logging.info(
         "Resumen: copiados=%d, IDs sintéticos=%d, ubicaciones adicionales=%d, "
-        "ya existentes=%d, errores=%d.",
+        "ya existentes=%d, errores=%d, reconexiones=%d.",
         estadisticas["copiados"],
         estadisticas["ids_sinteticos"],
         estadisticas["ubicaciones_adicionales"],
         estadisticas["duplicados"],
         estadisticas["errores"],
+        reconexiones,
     )
     return estadisticas["errores"]
 
