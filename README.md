@@ -7,12 +7,16 @@ existen allí.
 ## Qué hace
 
 - Se conecta por SSL a **mail.merom.eu:993** y a **imap.gmail.com:993**.
-- Revisa todas las carpetas de origen, incluida la Papelera. Omite Borradores y
-  Spam/Junk.
+- Revisa todas las carpetas de origen, incluida la Papelera y Spam/Junk. Solo
+  omite Borradores. Los mensajes de Spam/Junk reciben la etiqueta MEROM/Spam.
 - Busca mensajes desde los últimos 3 días por defecto. La búsqueda IMAP usa la
   fecha inclusiva **SINCE**.
-- Lee el mensaje con **BODY.PEEK[]** y selecciona cada carpeta de origen con
-  **readonly=True**.
+- Primero lee solo **Message-ID** con **BODY.PEEK[HEADER.FIELDS
+  (MESSAGE-ID)]**. Si tiene un ID válido y ya está en Gmail, no descarga el
+  cuerpo. Si no está, descarga el original con **BODY.PEEK[]** e
+  **INTERNALDATE**; si carece de ID válido, necesita esos bytes para calcular
+  SHA-256 y detectar una copia previa.
+- Selecciona cada carpeta de origen siempre con **readonly=True**.
 - Comprueba el **Message-ID** con la búsqueda Gmail **X-GM-RAW** en la carpeta
   con atributo **\\All**. Si ya existe, no lo vuelve a copiar.
 - Usa **APPEND** para guardar el mensaje original completo en **MEROM**, conserva
@@ -22,8 +26,13 @@ existen allí.
 - Si un mensaje falla, registra el tipo de error y continúa con los demás. Los
   registros no imprimen direcciones, asuntos, identificadores ni contenido del
   correo.
-- Un mensaje sin un **Message-ID** válido se registra como error y se omite,
-  porque no se puede comprobar su existencia previa en Gmail.
+- Si un mensaje no tiene un **Message-ID** válido, calcula SHA-256 sobre sus
+  bytes originales y antepone una cabecera **Message-ID** sintética a la copia.
+  No altera el resto del mensaje y puede detectar esa copia en las siguientes
+  ejecuciones.
+- Tras la pasada normal, vuelve a revisar la bandeja de entrada, Spam y
+  Papelera cada 60 segundos durante 8 minutos para recoger mensajes que hayan
+  llegado mientras corría la copia.
 - Ejecuta la copia cada 10 minutos y permite lanzarla manualmente con otro
   número de días.
 - El workflow mensual confirma la fecha en
