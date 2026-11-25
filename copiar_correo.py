@@ -303,20 +303,40 @@ def procesar_mensaje(
     fecha_interna: datetime | None = None
     id_sintetico = False
 
-    if not message_id:
-        # El hash se calcula sobre los bytes originales, antes de añadir la
-        # única cabecera sintética que tendrá la copia en Gmail.
+    def usar_id_sintetico() -> None:
+        """Identificador estable calculado del contenido (sha256)."""
+        nonlocal message_id, mensaje_para_gmail, fecha_interna, id_sintetico
+        # El hash se calcula sobre los bytes originales, antes de tocar nada.
         respuesta = origen.fetch([uid], ["BODY.PEEK[]", "INTERNALDATE"])
         mensaje_original, fecha_interna = obtener_cuerpo_y_fecha(respuesta[uid])
         hash_mensaje = hashlib.sha256(mensaje_original).hexdigest()
         message_id = f"{hash_mensaje}@copia.merom"
+        # Si traía un Message-ID que Gmail no sabe buscar, se conserva renombrado.
+        fin_cabeceras = mensaje_original.find(b"\r\n\r\n")
+        if fin_cabeceras == -1:
+            fin_cabeceras = mensaje_original.find(b"\n\n")
+        cabeceras = mensaje_original[:fin_cabeceras] if fin_cabeceras != -1 else b""
+        cabeceras_nuevas = re.sub(
+            rb"(?im)^message-id:", b"X-Original-Message-ID:", cabeceras, count=1
+        )
+        mensaje_original = cabeceras_nuevas + mensaje_original[len(cabeceras):]
         mensaje_para_gmail = (
             f"Message-ID: <{message_id}>\r\n".encode("ascii") + mensaje_original
         )
         id_sintetico = True
 
+    if not message_id:
+        usar_id_sintetico()
+
+    try:
+        uids_existentes = buscar_en_gmail(gmail, message_id)
+    except Exception as error:
+        if es_error_de_conexion(error) or id_sintetico:
+            raise
+        # Gmail no acepta buscar este Message-ID: se usa el identificador sintético.
+        usar_id_sintetico()
+        uids_existentes = buscar_en_gmail(gmail, message_id)
     consulta = f"rfc822msgid:{message_id}"
-    uids_existentes = buscar_en_gmail(gmail, message_id)
     if uids_existentes:
         # Si esta ejecución ya copió el mismo mensaje desde otra carpeta,
         # aplica la etiqueta adicional sin crear otra copia.
